@@ -1,0 +1,20 @@
+{
+  "backup_root": "~/backups",
+  "compression_enabled": true,
+  "compression_level": 6,
+  "follow_symlinks": false,
+  "exclude_patterns": [
+    ".git",
+    ".git/*",
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+    ".venv",
+    "venv",
+    ".DS_Store",
+    "*.swp",
+    "*.tmp",
+    ".lbm_staging.*"
+  ],
+  "retention_count": 10
+}
