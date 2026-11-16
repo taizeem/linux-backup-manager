@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from python.backup import BackupManager
 from python.config import BackupConfig
 from python.reporter import BackupSummaryReport, format_size, render_backup_report
+from python.restore import VALID_CONFLICT_POLICIES, RestoreManager
 from python.scanner import DirectoryScanner
 
 
@@ -153,6 +154,74 @@ def handle_verify(args: argparse.Namespace, config: BackupConfig) -> int:
     return 0
 
 
+def handle_restore(args: argparse.Namespace, config: BackupConfig) -> int:
+    """Restore a full/incremental backup or single file to target directory."""
+    restorer = RestoreManager(config=config)
+    dest_resolved = Path(args.dest).expanduser().resolve()
+    target_resolved = Path(args.target).expanduser().resolve()
+
+    try:
+        res = restorer.restore(
+            backup_id=args.backup_id,
+            target_dir=target_resolved,
+            dest_root=dest_resolved,
+            single_file=args.file if args.file else None,
+            on_conflict=args.conflict,
+        )
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 5
+    except FileExistsError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 6
+    except Exception as exc:
+        print(f"[ERROR] Restore failed: {exc}", file=sys.stderr)
+        return 6
+
+    print("==================================")
+    print("      LINUX BACKUP MANAGER")
+    print("==================================\n")
+    print("Action: restore")
+    print(f"Backup ID: {res.backup_id}")
+    print(f"Destination: {dest_resolved}")
+    print(f"Restore Target: {res.target_dir}")
+    print(f"Files restored: {res.files_restored}")
+    print(f"Files skipped (conflict): {res.files_skipped_conflict}")
+    print(f"Restore status: {res.status}")
+    print("\n==================================")
+    return 0
+
+
+def handle_delete(args: argparse.Namespace, config: BackupConfig) -> int:
+    """Delete a backup snapshot and its SQLite catalog metadata."""
+    manager = BackupManager(config=config)
+    dest_resolved = Path(args.dest).expanduser().resolve()
+    try:
+        deleted = manager.delete_backup(
+            backup_id=args.backup_id, dest_root=dest_resolved
+        )
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    if not deleted:
+        print(
+            f"[ERROR] Backup '{args.backup_id}' not found in {dest_resolved}",
+            file=sys.stderr,
+        )
+        return 5
+
+    print("==================================")
+    print("      LINUX BACKUP MANAGER")
+    print("==================================\n")
+    print("Action: delete")
+    print(f"Backup ID: {args.backup_id}")
+    print(f"Destination: {dest_resolved}")
+    print("Delete status: SUCCESS")
+    print("\n==================================")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lbm-engine",
@@ -213,6 +282,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--dest", required=True, help="Destination backup root path"
     )
 
+    # 'restore' subcommand
+    restore_parser = subparsers.add_parser("restore", help="Restore a backup")
+    restore_parser.add_argument(
+        "--backup-id", required=True, help="Backup identifier to restore"
+    )
+    restore_parser.add_argument(
+        "--dest", required=True, help="Destination backup root path"
+    )
+    restore_parser.add_argument(
+        "--target", required=True, help="Target directory for restored files"
+    )
+    restore_parser.add_argument(
+        "--file", default="", help="Optional single relative file path to restore"
+    )
+    restore_parser.add_argument(
+        "--conflict",
+        choices=VALID_CONFLICT_POLICIES,
+        default="fail",
+        help="Conflict handling policy when target file already exists",
+    )
+
+    # 'delete' subcommand
+    delete_parser = subparsers.add_parser("delete", help="Delete a backup")
+    delete_parser.add_argument(
+        "--backup-id", required=True, help="Backup identifier to delete"
+    )
+    delete_parser.add_argument(
+        "--dest", required=True, help="Destination backup root path"
+    )
+
     return parser
 
 
@@ -229,6 +328,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return handle_list(args, config)
     if args.command == "verify":
         return handle_verify(args, config)
+    if args.command == "restore":
+        return handle_restore(args, config)
+    if args.command == "delete":
+        return handle_delete(args, config)
 
     return 1
 
