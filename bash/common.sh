@@ -2,7 +2,7 @@
 # ==============================================================================
 # File: bash/common.sh
 # Description: Shared constants, exit codes, logging helpers, temporary staging,
-#              and filesystem permission validators for Linux Backup Manager.
+#              archive execution, and filesystem permission validators.
 # ==============================================================================
 
 set -euo pipefail
@@ -201,4 +201,67 @@ cleanup_active_temp_dirs() {
 # Register the cleanup handler for EXIT, INT, and TERM signals
 register_cleanup_trap() {
     trap cleanup_active_temp_dirs EXIT INT TERM
+}
+
+# ------------------------------------------------------------------------------
+# Archive & Compression Execution Helpers (tar + gzip)
+# ------------------------------------------------------------------------------
+
+# Build a tar (or tar.gz) archive from a NUL-delimited file list
+execute_tar_archive() {
+    local source_root="$1"
+    local null_file_list="$2"
+    local output_archive="$3"
+    local compress_enabled="${4:-true}"
+    local compress_level="${5:-6}"
+
+    if [[ ! -f "${null_file_list}" ]]; then
+        log_error "File list for archiving does not exist: ${null_file_list}"
+        return "${EXIT_RUNTIME_ERROR}"
+    fi
+
+    if [[ "${compress_enabled}" == "true" ]]; then
+        if ! tar -C "${source_root}" --no-recursion --null -T "${null_file_list}" -cf - \
+            | gzip "-${compress_level}" -n > "${output_archive}"; then
+            log_error "Failed to create compressed archive: ${output_archive}"
+            return "${EXIT_RUNTIME_ERROR}"
+        fi
+    else
+        if ! tar -C "${source_root}" --no-recursion --null -T "${null_file_list}" -cf "${output_archive}"; then
+            log_error "Failed to create uncompressed archive: ${output_archive}"
+            return "${EXIT_RUNTIME_ERROR}"
+        fi
+    fi
+
+    verify_tar_archive "${output_archive}" "${compress_enabled}" || return "$?"
+    return "${EXIT_SUCCESS}"
+}
+
+# Validate archive stream structure using gzip -t and tar -tf
+verify_tar_archive() {
+    local archive_path="$1"
+    local compress_enabled="${2:-true}"
+
+    if [[ ! -f "${archive_path}" ]]; then
+        log_error "Archive file missing during validation: ${archive_path}"
+        return "${EXIT_BACKUP_NOT_FOUND}"
+    fi
+
+    if [[ "${compress_enabled}" == "true" ]]; then
+        if ! gzip -t "${archive_path}" >/dev/null 2>&1; then
+            log_error "Corrupted gzip stream detected in archive: ${archive_path}"
+            return "${EXIT_RUNTIME_ERROR}"
+        fi
+        if ! tar -tzf "${archive_path}" >/dev/null 2>&1; then
+            log_error "Corrupted tar structure detected in archive: ${archive_path}"
+            return "${EXIT_RUNTIME_ERROR}"
+        fi
+    else
+        if ! tar -tf "${archive_path}" >/dev/null 2>&1; then
+            log_error "Corrupted tar structure detected in archive: ${archive_path}"
+            return "${EXIT_RUNTIME_ERROR}"
+        fi
+    fi
+
+    return "${EXIT_SUCCESS}"
 }
