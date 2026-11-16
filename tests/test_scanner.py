@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+import io
+import json
 import os
 import stat
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -11,11 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from python.config import BackupConfig
+from python.main import main as lbm_main
+from python.reporter import BackupSummaryReport, format_size, render_backup_report
 from python.scanner import DirectoryScanner
 
 
 class TestPhase2ScannerAndConfig(unittest.TestCase):
-    """Verify recursive scanning, inode metadata, symlinks, exclusions, and permissions."""
+    """Verify recursive scanning, inode metadata, symlinks, exclusions, permissions, and reporting."""
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(prefix="lbm_test_p2_")
@@ -90,14 +95,12 @@ class TestPhase2ScannerAndConfig(unittest.TestCase):
         dangling_link = self.root / "broken_link.txt"
         dangling_link.symlink_to("non_existent_target.txt")
 
-        # Create a circular directory symlink pointing back to root!
         loop_link = self.root / "infinite_loop"
         loop_link.symlink_to(self.root)
 
         scanner = DirectoryScanner(follow_symlinks=False)
         res = scanner.scan(self.root)
 
-        # Should discover 1 real file + 3 symlinks cleanly without infinite recursion
         self.assertEqual(res.files_discovered, 4)
         self.assertEqual(res.symlinks_discovered, 3)
 
@@ -154,6 +157,43 @@ class TestPhase2ScannerAndConfig(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             BackupConfig(compression_level=99)
+
+    def test_format_size_and_render_backup_report(self) -> None:
+        self.assertEqual(format_size(0), "0 B")
+        self.assertEqual(format_size(512), "512 B")
+        self.assertEqual(format_size(2048), "2 KB")
+        self.assertEqual(format_size(125 * 1024 * 1024), "125 MB")
+
+        report = BackupSummaryReport(
+            source_path="/home/user/Documents",
+            destination_path="/home/user/backups",
+            files_discovered=245,
+            files_backed_up=245,
+            files_skipped=0,
+            backup_size_bytes=125 * 1024 * 1024,
+            compression_enabled=True,
+            status="SUCCESS",
+        )
+        text = render_backup_report(report)
+        self.assertIn("LINUX BACKUP MANAGER", text)
+        self.assertIn("Files discovered: 245", text)
+        self.assertIn("Backup size: 125 MB", text)
+        self.assertIn("Backup status: SUCCESS", text)
+
+    def test_main_cli_scan_json_and_custom_exclude(self) -> None:
+        (self.root / "data.csv").write_text("a,b,c\n", encoding="utf-8")
+        (self.root / "debug.log").write_text("log line\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = lbm_main(
+                ["scan", "--source", str(self.root), "--exclude", "*.log", "--json"]
+            )
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["files_discovered"], 1)
+        self.assertEqual(payload["files_skipped_excluded"], 1)
+        self.assertEqual(payload["files"][0]["relative_path"], "data.csv")
 
 
 if __name__ == "__main__":
