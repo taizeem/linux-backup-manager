@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full and incremental backup orchestration, archive creation via Bash, and verification."""
+"""Full and incremental backup orchestration, SQLite catalog integration, and verification."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from python.config import BackupConfig
+from python.database import BackupDatabase
 from python.hasher import calculate_file_sha256
 from python.incremental import (
     IncrementalDiff,
@@ -131,10 +132,13 @@ def invoke_bash_verify_archive(
 
 
 class BackupManager:
-    """Orchestrates full and incremental backups, version listing, and verification."""
+    """Orchestrates full and incremental backups, SQLite persistence, and verification."""
 
     def __init__(self, config: BackupConfig | None = None) -> None:
         self.config = config or BackupConfig.from_json_file()
+
+    def _get_db(self, dest_root: Path) -> BackupDatabase:
+        return BackupDatabase.for_backup_root(dest_root)
 
     def create_backup(
         self,
@@ -145,7 +149,7 @@ class BackupManager:
         backup_id: str | None = None,
         incremental: bool = False,
     ) -> BackupMetadata:
-        """Create a full or incremental backup snapshot and commit it atomically."""
+        """Create a full or incremental backup snapshot, commit it atomically, and record in SQLite."""
         src_path = Path(source_dir).expanduser().resolve()
         dst_root = (
             Path(dest_root).expanduser().resolve()
@@ -167,12 +171,13 @@ class BackupManager:
         )
         scan_result: ScanResult = scanner.scan(src_path)
 
-        # Check for parent snapshot if incremental mode was requested
         parent_meta: dict[str, object] | None = None
         if incremental:
             parent_meta = find_latest_backup_for_source(dst_root, src_path)
 
-        backup_type = "incremental" if (incremental and parent_meta is not None) else "full"
+        backup_type = (
+            "incremental" if (incremental and parent_meta is not None) else "full"
+        )
         parent_backup_id: str | None = None
         diff: IncrementalDiff | None = None
 
@@ -234,7 +239,6 @@ class BackupManager:
             archive_sha256 = calculate_file_sha256(staged_archive_path)
             archive_size = staged_archive_path.stat().st_size
 
-            # Save full current state in manifest.json so subsequent incrementals have complete state
             write_json_manifest(scan_result, staged_snapshot_dir / "manifest.json")
             write_sha256sums_file(
                 entries_to_archive, staged_snapshot_dir / "sha256sums.txt"
@@ -271,7 +275,13 @@ class BackupManager:
                 json.dumps(metadata.to_dict(), indent=2) + "\n", encoding="utf-8"
             )
 
+            # Atomic rename(2) into dst_root/<backup_id>
             os.replace(staged_snapshot_dir, final_backup_dir)
+
+            # Persist snapshot and file catalog into SQLite
+            db = self._get_db(dst_root)
+            db.record_backup(metadata.to_dict(), scan_result.files, diff=diff)
+
             return metadata
         finally:
             if owns_staging and stage_root.exists():
@@ -322,7 +332,11 @@ class BackupManager:
             if dest_root is not None
             else self.config.backup_root.expanduser().resolve()
         )
-        raw_list = discover_backup_snapshots(dst_root)
+        db = self._get_db(dst_root)
+        raw_list = db.list_backups()
+        if not raw_list:
+            raw_list = discover_backup_snapshots(dst_root)
+
         results: list[BackupMetadata] = []
         for item in raw_list:
             results.append(
@@ -351,17 +365,44 @@ class BackupManager:
             )
         return results
 
-    def verify_backup(
+    def delete_backup(
         self, backup_id: str, dest_root: Path | str | None = None
-    ) -> VerificationResult:
-        """Verify the integrity of a full or incremental backup snapshot."""
+    ) -> bool:
+        """Safely delete a backup snapshot directory and its SQLite catalog records."""
+        if "/" in backup_id or ".." in backup_id or not backup_id.strip():
+            raise ValueError(f"Invalid backup_id: {backup_id!r}")
+
         dst_root = (
             Path(dest_root).expanduser().resolve()
             if dest_root is not None
             else self.config.backup_root.expanduser().resolve()
         )
+        snapshot_dir = (dst_root / backup_id).resolve()
+        if dst_root not in snapshot_dir.parents:
+            raise ValueError(f"Refusing to delete path outside backup root: {snapshot_dir}")
+
+        existed_on_disk = False
+        if snapshot_dir.is_dir():
+            shutil.rmtree(snapshot_dir)
+            existed_on_disk = True
+
+        db = self._get_db(dst_root)
+        deleted_in_db = db.delete_backup_record(backup_id)
+        return existed_on_disk or deleted_in_db
+
+    def verify_backup(
+        self, backup_id: str, dest_root: Path | str | None = None
+    ) -> VerificationResult:
+        """Verify the integrity of a full or incremental backup snapshot and log in SQLite."""
+        dst_root = (
+            Path(dest_root).expanduser().resolve()
+            if dest_root is not None
+            else self.config.backup_root.expanduser().resolve()
+        )
+        db = self._get_db(dst_root)
         snapshot_dir = dst_root / backup_id
         if not snapshot_dir.is_dir():
+            db.log_event("VERIFY", backup_id, "FAILED", "Snapshot directory missing")
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -371,6 +412,7 @@ class BackupManager:
         meta_path = snapshot_dir / "backup_meta.json"
         manifest_path = snapshot_dir / "manifest.json"
         if not meta_path.is_file() or not manifest_path.is_file():
+            db.log_event("VERIFY", backup_id, "FAILED", "Incomplete metadata files")
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -385,6 +427,7 @@ class BackupManager:
 
         archive_path = snapshot_dir / archive_name
         if not archive_path.is_file():
+            db.log_event("VERIFY", backup_id, "FAILED", "Archive file missing")
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -394,6 +437,7 @@ class BackupManager:
 
         actual_archive_hash = calculate_file_sha256(archive_path)
         if actual_archive_hash != expected_archive_hash:
+            db.log_event("VERIFY", backup_id, "FAILED", "Archive SHA-256 mismatch")
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -404,6 +448,7 @@ class BackupManager:
             )
 
         if not invoke_bash_verify_archive(archive_path, compression_enabled):
+            db.log_event("VERIFY", backup_id, "FAILED", "Archive tar/gzip structure corrupted")
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -413,10 +458,10 @@ class BackupManager:
 
         all_manifest_entries = load_json_manifest(manifest_path)
 
-        # For incremental backups, only archived_paths are inside this snapshot's tar archive
         if backup_type == "incremental":
             diff_path = snapshot_dir / "incremental_diff.json"
             if not diff_path.is_file():
+                db.log_event("VERIFY", backup_id, "FAILED", "Missing incremental_diff.json")
                 return VerificationResult(
                     target_root=str(snapshot_dir),
                     is_valid=False,
@@ -439,6 +484,7 @@ class BackupManager:
                 check=False,
             )
             if proc.returncode != 0:
+                db.log_event("VERIFY", backup_id, "FAILED", "Archive extraction failed")
                 return VerificationResult(
                     target_root=str(snapshot_dir),
                     is_valid=False,
@@ -450,6 +496,12 @@ class BackupManager:
 
             ver_res = verify_directory_against_manifest(
                 extract_tmp, expected_entries, check_unexpected=True
+            )
+            db.log_event(
+                "VERIFY",
+                backup_id,
+                "SUCCESS" if ver_res.is_valid else "FAILED",
+                f"Verified {len(ver_res.verified_files)} file(s)",
             )
             return VerificationResult(
                 target_root=str(snapshot_dir),
