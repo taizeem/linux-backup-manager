@@ -18,11 +18,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from python.config import DEFAULT_EXCLUDE_PATTERNS
+from python.hasher import calculate_file_sha256, calculate_symlink_sha256
 
 
 @dataclass(frozen=True)
 class FileMetadata:
-    """Inode and path metadata for a single discovered filesystem entry."""
+    """Inode, path, and optional SHA-256 metadata for a discovered filesystem entry."""
 
     relative_path: str
     absolute_path: str
@@ -37,6 +38,7 @@ class FileMetadata:
     inode: int
     is_symlink: bool = False
     symlink_target: str | None = None
+    sha256: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -75,9 +77,11 @@ class DirectoryScanner:
         self,
         exclude_patterns: Sequence[str] = DEFAULT_EXCLUDE_PATTERNS,
         follow_symlinks: bool = False,
+        compute_hashes: bool = False,
     ) -> None:
         self.exclude_patterns: tuple[str, ...] = tuple(exclude_patterns)
         self.follow_symlinks: bool = follow_symlinks
+        self.compute_hashes: bool = compute_hashes
 
     def is_excluded(self, relative_path: str, entry_name: str) -> bool:
         """Check whether an entry matches any configured exclusion glob pattern."""
@@ -103,7 +107,6 @@ class DirectoryScanner:
 
         result = ScanResult(source_root=str(root_path))
         self._scan_recursive(root_path, root_path, result)
-        # Sort deterministically by relative_path so backup manifests are reproducible
         result.files.sort(key=lambda item: item.relative_path)
         return result
 
@@ -122,7 +125,6 @@ class DirectoryScanner:
         result.directories_visited += 1
 
         with scandir_iter as entries:
-            # Sort entries by name for deterministic traversal order
             sorted_entries = sorted(entries, key=lambda e: e.name)
             for entry in sorted_entries:
                 entry_path = Path(entry.path)
@@ -142,13 +144,18 @@ class DirectoryScanner:
                     result.permission_errors.append(f"{entry_path}: {exc.strerror}")
                     continue
 
-                mode_Format = stat.S_IFMT(st.st_mode)
+                mode_format = stat.S_IFMT(st.st_mode)
                 perms_octal = f"{stat.S_IMODE(st.st_mode):04o}"
 
                 # Handle symbolic links when follow_symlinks is False (default)
                 if is_symlink and not self.follow_symlinks:
                     try:
                         link_target = os.readlink(entry_path)
+                        link_hash = (
+                            calculate_symlink_sha256(entry_path)
+                            if self.compute_hashes
+                            else None
+                        )
                     except OSError as exc:
                         result.permission_errors.append(f"{entry_path}: {exc.strerror}")
                         continue
@@ -167,6 +174,7 @@ class DirectoryScanner:
                         inode=int(st.st_ino),
                         is_symlink=True,
                         symlink_target=link_target,
+                        sha256=link_hash,
                     )
                     result.files.append(meta)
                     result.files_discovered += 1
@@ -174,15 +182,25 @@ class DirectoryScanner:
                     continue
 
                 # Handle subdirectories
-                if mode_Format == stat.S_IFDIR:
+                if mode_format == stat.S_IFDIR:
                     self._scan_recursive(root_path, entry_path, result)
                     continue
 
                 # Handle regular files
-                if mode_Format == stat.S_IFREG:
+                if mode_format == stat.S_IFREG:
                     if not os.access(entry_path, os.R_OK):
                         result.permission_errors.append(str(entry_path))
                         continue
+
+                    file_hash: str | None = None
+                    if self.compute_hashes:
+                        try:
+                            file_hash = calculate_file_sha256(entry_path)
+                        except OSError as exc:
+                            result.permission_errors.append(
+                                f"{entry_path}: {exc.strerror}"
+                            )
+                            continue
 
                     meta = FileMetadata(
                         relative_path=rel_path,
@@ -198,6 +216,7 @@ class DirectoryScanner:
                         inode=int(st.st_ino),
                         is_symlink=False,
                         symlink_target=None,
+                        sha256=file_hash,
                     )
                     result.files.append(meta)
                     result.files_discovered += 1
@@ -210,13 +229,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("source_dir", help="Path to source directory to scan")
     parser.add_argument(
+        "--hash",
+        action="store_true",
+        help="Compute SHA-256 digests for discovered entries",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit scan summary and file metadata as formatted JSON",
     )
     args = parser.parse_args(argv)
 
-    scanner = DirectoryScanner()
+    scanner = DirectoryScanner(compute_hashes=args.hash)
     try:
         scan_res = scanner.scan(args.source_dir)
     except (FileNotFoundError, NotADirectoryError) as exc:
