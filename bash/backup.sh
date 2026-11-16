@@ -33,10 +33,12 @@ Commands:
 Options:
   -d, --dest <dest_dir>    Override destination backup root directory
                            (Default: \$LBM_BACKUP_ROOT or ~/backups)
+  -i, --incremental        Create an incremental backup relative to latest snapshot
   -h, --help               Show this help message and exit
 
 Examples:
   ./backup.sh create ~/Documents
+  ./backup.sh create ~/Documents --incremental
   ./backup.sh list
   ./backup.sh verify backup_2026_11_16
   ./backup.sh restore backup_2026_11_16
@@ -48,6 +50,7 @@ EOF
 cmd_create() {
     local source_arg="${1:-}"
     local dest_root="${2:-${DEFAULT_BACKUP_ROOT}}"
+    local incremental_flag="${3:-false}"
 
     if [[ -z "${source_arg}" ]]; then
         log_error "'create' requires a source directory argument."
@@ -77,11 +80,18 @@ cmd_create() {
     staging_dir="$(create_staging_dir "${canonical_dest}")" || exit "$?"
     LBM_ACTIVE_TEMP_DIRS+=("${staging_dir}")
 
+    local -a py_args=(
+        create
+        --source "${canonical_src}"
+        --dest "${canonical_dest}"
+        --staging "${staging_dir}"
+    )
+    if [[ "${incremental_flag}" == "true" ]]; then
+        py_args+=(--incremental)
+    fi
+
     # Delegate file discovery and backup orchestration to the Python engine
-    python3 "${LBM_PROJECT_ROOT}/python/main.py" create \
-        --source "${canonical_src}" \
-        --dest "${canonical_dest}" \
-        --staging "${staging_dir}" || exit "$?"
+    python3 "${LBM_PROJECT_ROOT}/python/main.py" "${py_args[@]}" || exit "$?"
 
     exit "${EXIT_SUCCESS}"
 }
@@ -94,10 +104,7 @@ cmd_list() {
     local canonical_dest
     canonical_dest="$(resolve_canonical_path "${dest_root}")"
 
-    print_banner
-    printf "Destination: %s\n" "${canonical_dest}"
-    printf "Recorded backups: (Catalog integration pending Phase 6)\n"
-    print_footer
+    python3 "${LBM_PROJECT_ROOT}/python/main.py" list --dest "${canonical_dest}" || exit "$?"
     exit "${EXIT_SUCCESS}"
 }
 
@@ -139,6 +146,7 @@ main() {
     local subcommand=""
     local target_arg=""
     local dest_override="${DEFAULT_BACKUP_ROOT}"
+    local incremental_mode="false"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -153,6 +161,10 @@ main() {
                 fi
                 dest_override="$2"
                 shift 2
+                ;;
+            -i|--incremental)
+                incremental_mode="true"
+                shift
                 ;;
             create|list|restore|verify|delete|cleanup)
                 if [[ -z "${subcommand}" ]]; then
@@ -189,7 +201,7 @@ main() {
 
     case "${subcommand}" in
         create)
-            cmd_create "${target_arg}" "${dest_override}"
+            cmd_create "${target_arg}" "${dest_override}" "${incremental_mode}"
             ;;
         list)
             if [[ -n "${target_arg}" ]]; then

@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from python.backup import BackupManager
 from python.config import BackupConfig
-from python.reporter import BackupSummaryReport, render_backup_report
+from python.reporter import BackupSummaryReport, format_size, render_backup_report
 from python.scanner import DirectoryScanner
 
 
@@ -57,14 +57,15 @@ def handle_scan(args: argparse.Namespace, config: BackupConfig) -> int:
 
 
 def handle_create(args: argparse.Namespace, config: BackupConfig) -> int:
-    """Orchestrate full backup creation and print the summary report."""
+    """Orchestrate full or incremental backup creation and print the summary report."""
     manager = BackupManager(config=config)
     try:
-        metadata = manager.create_full_backup(
+        metadata = manager.create_backup(
             source_dir=args.source,
             dest_root=args.dest,
             staging_dir=args.staging if args.staging else None,
             extra_excludes=args.exclude or (),
+            incremental=bool(args.incremental),
         )
     except (FileNotFoundError, NotADirectoryError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -94,6 +95,34 @@ def handle_create(args: argparse.Namespace, config: BackupConfig) -> int:
     return 0
 
 
+def handle_list(args: argparse.Namespace, config: BackupConfig) -> int:
+    """List all recorded backup versions in the destination repository."""
+    manager = BackupManager(config=config)
+    dest_resolved = Path(args.dest).expanduser().resolve()
+    backups = manager.list_backups(dest_root=dest_resolved)
+
+    print("==================================")
+    print("      LINUX BACKUP MANAGER")
+    print("==================================\n")
+    print(f"Destination: {dest_resolved}")
+    print(f"Total backups: {len(backups)}\n")
+
+    if not backups:
+        print("No backups found.")
+    else:
+        for b in backups:
+            parent_info = f" (parent: {b.parent_backup_id})" if b.parent_backup_id else ""
+            print(
+                f"- {b.backup_id} [{b.backup_type.upper()}]{parent_info} | "
+                f"Files: {b.files_backed_up}/{b.files_discovered} | "
+                f"Size: {format_size(b.archive_size_bytes)} | "
+                f"Created: {b.created_at}"
+            )
+
+    print("\n==================================")
+    return 0
+
+
 def handle_verify(args: argparse.Namespace, config: BackupConfig) -> int:
     """Verify an existing backup snapshot's archive and per-file SHA-256 manifest."""
     manager = BackupManager(config=config)
@@ -109,7 +138,11 @@ def handle_verify(args: argparse.Namespace, config: BackupConfig) -> int:
     print(f"Files verified: {len(result.verified_files)}")
     print(f"Files modified/corrupted: {len(result.modified_files)}")
     print(f"Files missing: {len(result.missing_files)}")
-    status_str = "SUCCESS (INTEGRITY VERIFIED)" if result.is_valid else "FAILED (CORRUPTION DETECTED)"
+    status_str = (
+        "SUCCESS (INTEGRITY VERIFIED)"
+        if result.is_valid
+        else "FAILED (CORRUPTION DETECTED)"
+    )
     print(f"\nVerification status: {status_str}")
     print("\n==================================")
 
@@ -153,10 +186,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--staging", default="", help="Temporary staging directory created by Bash"
     )
     create_parser.add_argument(
+        "-i",
+        "--incremental",
+        action="store_true",
+        help="Perform an incremental backup relative to the latest snapshot",
+    )
+    create_parser.add_argument(
         "--exclude",
         action="append",
         default=[],
         help="Additional exclusion glob pattern",
+    )
+
+    # 'list' subcommand
+    list_parser = subparsers.add_parser("list", help="List recorded backups")
+    list_parser.add_argument(
+        "--dest", required=True, help="Destination backup root path"
     )
 
     # 'verify' subcommand
@@ -180,6 +225,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return handle_scan(args, config)
     if args.command == "create":
         return handle_create(args, config)
+    if args.command == "list":
+        return handle_list(args, config)
     if args.command == "verify":
         return handle_verify(args, config)
 
