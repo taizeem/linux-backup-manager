@@ -10,8 +10,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bash/common.sh
 source "${SCRIPT_DIR}/common.sh"
+# shellcheck source=bash/restore.sh
+source "${SCRIPT_DIR}/restore.sh"
+# shellcheck source=bash/cleanup.sh
+source "${SCRIPT_DIR}/cleanup.sh"
 
-#Print CLI usage instructions
+register_cleanup_trap
+
+# Print CLI usage instructions
 usage() {
     cat <<EOF
 Usage: $(basename "$0") <command> [arguments] [options]
@@ -22,6 +28,7 @@ Commands:
   restore <backup_id>      Restore a specific backup by ID
   verify <backup_id>       Verify integrity of a specific backup by ID
   delete <backup_id>       Delete a specific backup by ID
+  cleanup                  Remove stale temporary staging artifacts
 
 Options:
   -d, --dest <dest_dir>    Override destination backup root directory
@@ -29,11 +36,11 @@ Options:
   -h, --help               Show this help message and exit
 
 Examples:
-  ./bash/backup.sh create ~/Documents
-  ./bash/backup.sh list
-  ./bash/backup.sh verify backup_2026_11_16
-  ./bash/backup.sh restore backup_2026_11_16
-  ./bash/backup.sh delete backup_2026_11_16
+  ./backup.sh create ~/Documents
+  ./backup.sh list
+  ./backup.sh verify backup_2026_11_16
+  ./backup.sh restore backup_2026_11_16
+  ./backup.sh delete backup_2026_11_16
 EOF
 }
 
@@ -65,6 +72,11 @@ cmd_create() {
         exit "${EXIT_INVALID_ARGS}"
     fi
 
+    # Create and verify atomic staging directory (automatically removed on EXIT by trap)
+    local staging_dir
+    staging_dir="$(create_staging_dir "${canonical_dest}")" || exit "$?"
+    LBM_ACTIVE_TEMP_DIRS+=("${staging_dir}")
+
     print_banner
     printf "Source: %s\n" "${canonical_src}"
     printf "Destination: %s\n\n" "${canonical_dest}"
@@ -73,7 +85,7 @@ cmd_create() {
     printf "Files skipped: 0\n\n"
     printf "Backup size: 0 MB\n"
     printf "Compression: Enabled\n\n"
-    printf "Backup status: READY \n"
+    printf "Backup status: READY\n"
     print_footer
     exit "${EXIT_SUCCESS}"
 }
@@ -93,7 +105,7 @@ cmd_list() {
     exit "${EXIT_SUCCESS}"
 }
 
-# Handle 'restore', 'verify', and 'delete' commands that require a <backup_id>
+# Handle 'verify' and 'delete' commands that require a <backup_id>
 cmd_backup_id_action() {
     local action="$1"
     local backup_id="${2:-}"
@@ -105,13 +117,9 @@ cmd_backup_id_action() {
         exit "${EXIT_INVALID_ARGS}"
     fi
 
-    # Reject path traversal characters in backup_id for safety
-    if [[ "${backup_id}" == *"/"* || "${backup_id}" == *".."* ]]; then
-        log_error "Invalid backup ID '${backup_id}': must not contain path separators or '..'."
-        exit "${EXIT_INVALID_ARGS}"
-    fi
-
+    validate_backup_id "${backup_id}" || exit "$?"
     ensure_destination_directory "${dest_root}" || exit "$?"
+
     local canonical_dest
     canonical_dest="$(resolve_canonical_path "${dest_root}")"
 
@@ -150,7 +158,7 @@ main() {
                 dest_override="$2"
                 shift 2
                 ;;
-            create|list|restore|verify|delete)
+            create|list|restore|verify|delete|cleanup)
                 if [[ -z "${subcommand}" ]]; then
                     subcommand="$1"
                     shift
@@ -194,8 +202,20 @@ main() {
             fi
             cmd_list "${dest_override}"
             ;;
-        restore|verify|delete)
+        restore)
+            if [[ -z "${target_arg}" ]]; then
+                log_error "'restore' requires a backup ID argument (e.g., backup_2026_11_16)."
+                usage >&2
+                exit "${EXIT_INVALID_ARGS}"
+            fi
+            run_restore_preflight "${target_arg}" "${dest_override}" "" || exit "$?"
+            ;;
+        verify|delete)
             cmd_backup_id_action "${subcommand}" "${target_arg}" "${dest_override}"
+            ;;
+        cleanup)
+            ensure_destination_directory "${dest_override}" || exit "$?"
+            purge_stale_temp_artifacts "${dest_override}" || exit "$?"
             ;;
     esac
 }
