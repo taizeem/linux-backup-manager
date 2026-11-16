@@ -77,16 +77,12 @@ cmd_create() {
     staging_dir="$(create_staging_dir "${canonical_dest}")" || exit "$?"
     LBM_ACTIVE_TEMP_DIRS+=("${staging_dir}")
 
-    print_banner
-    printf "Source: %s\n" "${canonical_src}"
-    printf "Destination: %s\n\n" "${canonical_dest}"
-    printf "Files discovered: 0\n"
-    printf "Files backed up: 0\n"
-    printf "Files skipped: 0\n\n"
-    printf "Backup size: 0 MB\n"
-    printf "Compression: Enabled\n\n"
-    printf "Backup status: READY\n"
-    print_footer
+    # Delegate file discovery and backup orchestration to the Python engine
+    python3 "${LBM_PROJECT_ROOT}/python/main.py" create \
+        --source "${canonical_src}" \
+        --dest "${canonical_dest}" \
+        --staging "${staging_dir}" || exit "$?"
+
     exit "${EXIT_SUCCESS}"
 }
 
