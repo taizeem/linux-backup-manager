@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Full and incremental backup orchestration, SQLite catalog integration, and verification."""
+"""Full and incremental backup orchestration, failure recovery, and verification."""
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
@@ -27,6 +28,7 @@ from python.incremental import (
     discover_backup_snapshots,
     find_latest_backup_for_source,
 )
+from python.reporter import get_logger
 from python.scanner import DirectoryScanner, FileMetadata, ScanResult
 from python.verifier import (
     VerificationResult,
@@ -62,6 +64,34 @@ class BackupMetadata:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    """Summary of incomplete snapshots and stale temporary artifacts cleaned up."""
+
+    incomplete_backups_removed: list[str] = field(default_factory=list)
+    staging_artifacts_removed: list[str] = field(default_factory=list)
+
+    @property
+    def total_cleaned(self) -> int:
+        return len(self.incomplete_backups_removed) + len(
+            self.staging_artifacts_removed
+        )
+
+
+def check_available_disk_space(dest_dir: Path | str, required_bytes: int) -> int:
+    """Verify via os.statvfs that dest_dir has at least required_bytes available for non-root users."""
+    target = Path(dest_dir).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    st = os.statvfs(target)
+    available_bytes = int(st.f_bavail) * int(st.f_frsize)
+    if required_bytes > available_bytes:
+        raise OSError(
+            errno.ENOSPC,
+            f"Insufficient disk space in {target}: required {required_bytes} bytes, available {available_bytes} bytes",
+        )
+    return available_bytes
 
 
 def generate_backup_id(dest_root: Path, now: datetime | None = None) -> str:
@@ -132,13 +162,96 @@ def invoke_bash_verify_archive(
 
 
 class BackupManager:
-    """Orchestrates full and incremental backups, SQLite persistence, and verification."""
+    """Orchestrates full and incremental backups, recovery, SQLite persistence, and verification."""
 
-    def __init__(self, config: BackupConfig | None = None) -> None:
+    def __init__(
+        self, config: BackupConfig | None = None, log_dir: Path | str | None = None
+    ) -> None:
         self.config = config or BackupConfig.from_json_file()
+        self.logger = get_logger(log_dir)
 
     def _get_db(self, dest_root: Path) -> BackupDatabase:
         return BackupDatabase.for_backup_root(dest_root)
+
+    def detect_incomplete_backups(
+        self, dest_root: Path | str | None = None
+    ) -> list[str]:
+        """Identify backup_* directories that are missing required metadata or archive files."""
+        dst_root = (
+            Path(dest_root).expanduser().resolve()
+            if dest_root is not None
+            else self.config.backup_root.expanduser().resolve()
+        )
+        if not dst_root.is_dir():
+            return []
+
+        incomplete: list[str] = []
+        for entry in sorted(dst_root.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir() or not entry.name.startswith("backup_"):
+                continue
+            meta_file = entry / "backup_meta.json"
+            manifest_file = entry / "manifest.json"
+            if not meta_file.is_file() or not manifest_file.is_file():
+                incomplete.append(entry.name)
+                continue
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                archive_name = str(meta.get("archive_filename", ""))
+                if (
+                    meta.get("status") != "SUCCESS"
+                    or not archive_name
+                    or not (entry / archive_name).is_file()
+                ):
+                    incomplete.append(entry.name)
+            except (OSError, json.JSONDecodeError):
+                incomplete.append(entry.name)
+
+        return incomplete
+
+    def recover_interrupted_backups(
+        self, dest_root: Path | str | None = None
+    ) -> RecoveryReport:
+        """Clean up incomplete backup snapshots and leftover .lbm_staging.* / *.tmp artifacts."""
+        dst_root = (
+            Path(dest_root).expanduser().resolve()
+            if dest_root is not None
+            else self.config.backup_root.expanduser().resolve()
+        )
+        if not dst_root.is_dir():
+            return RecoveryReport()
+
+        db = self._get_db(dst_root)
+        incomplete_ids = self.detect_incomplete_backups(dst_root)
+        removed_backups: list[str] = []
+        removed_staging: list[str] = []
+
+        for b_id in incomplete_ids:
+            target = dst_root / b_id
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            db.delete_backup_record(b_id)
+            db.log_event(
+                "RECOVER",
+                b_id,
+                "CLEANED",
+                "Removed incomplete/interrupted backup snapshot",
+            )
+            self.logger.warning("Recovered incomplete backup snapshot: %s", b_id)
+            removed_backups.append(b_id)
+
+        for entry in sorted(dst_root.iterdir(), key=lambda p: p.name):
+            if entry.name.startswith(".lbm_staging.") or entry.name.endswith(".tmp"):
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+                self.logger.warning("Cleaned stale temporary artifact: %s", entry.name)
+                removed_staging.append(entry.name)
+
+        return RecoveryReport(
+            incomplete_backups_removed=removed_backups,
+            staging_artifacts_removed=removed_staging,
+        )
 
     def create_backup(
         self,
@@ -199,6 +312,12 @@ class BackupManager:
             entries_to_archive = list(scan_result.files)
             files_skipped_count = scan_result.files_skipped_excluded
             files_deleted_count = 0
+
+        # Pre-flight disk space check via os.statvfs before writing archive
+        bytes_to_archive = sum(
+            m.size_bytes for m in entries_to_archive if not m.is_symlink
+        )
+        check_available_disk_space(dst_root, bytes_to_archive + 65536)
 
         resolved_backup_id = backup_id or generate_backup_id(dst_root)
         final_backup_dir = dst_root / resolved_backup_id
@@ -275,15 +394,27 @@ class BackupManager:
                 json.dumps(metadata.to_dict(), indent=2) + "\n", encoding="utf-8"
             )
 
-            # Atomic rename(2) into dst_root/<backup_id>
             os.replace(staged_snapshot_dir, final_backup_dir)
 
-            # Persist snapshot and file catalog into SQLite
             db = self._get_db(dst_root)
             db.record_backup(metadata.to_dict(), scan_result.files, diff=diff)
-
+            self.logger.info(
+                "Created %s backup %s for %s (%d files archived, %d bytes)",
+                backup_type,
+                resolved_backup_id,
+                src_path,
+                len(entries_to_archive),
+                archive_size,
+            )
             return metadata
+        except Exception as exc:
+            self.logger.error(
+                "Backup failed for %s: %s", src_path, exc
+            )
+            raise
         finally:
+            if staged_snapshot_dir.exists():
+                shutil.rmtree(staged_snapshot_dir, ignore_errors=True)
             if owns_staging and stage_root.exists():
                 shutil.rmtree(stage_root, ignore_errors=True)
 
@@ -379,7 +510,9 @@ class BackupManager:
         )
         snapshot_dir = (dst_root / backup_id).resolve()
         if dst_root not in snapshot_dir.parents:
-            raise ValueError(f"Refusing to delete path outside backup root: {snapshot_dir}")
+            raise ValueError(
+                f"Refusing to delete path outside backup root: {snapshot_dir}"
+            )
 
         existed_on_disk = False
         if snapshot_dir.is_dir():
@@ -388,6 +521,8 @@ class BackupManager:
 
         db = self._get_db(dst_root)
         deleted_in_db = db.delete_backup_record(backup_id)
+        if existed_on_disk or deleted_in_db:
+            self.logger.info("Deleted backup snapshot: %s", backup_id)
         return existed_on_disk or deleted_in_db
 
     def verify_backup(
@@ -403,6 +538,7 @@ class BackupManager:
         snapshot_dir = dst_root / backup_id
         if not snapshot_dir.is_dir():
             db.log_event("VERIFY", backup_id, "FAILED", "Snapshot directory missing")
+            self.logger.error("Verify failed for %s: directory missing", backup_id)
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -413,6 +549,7 @@ class BackupManager:
         manifest_path = snapshot_dir / "manifest.json"
         if not meta_path.is_file() or not manifest_path.is_file():
             db.log_event("VERIFY", backup_id, "FAILED", "Incomplete metadata files")
+            self.logger.error("Verify failed for %s: incomplete metadata", backup_id)
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -428,6 +565,7 @@ class BackupManager:
         archive_path = snapshot_dir / archive_name
         if not archive_path.is_file():
             db.log_event("VERIFY", backup_id, "FAILED", "Archive file missing")
+            self.logger.error("Verify failed for %s: archive missing", backup_id)
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -438,6 +576,7 @@ class BackupManager:
         actual_archive_hash = calculate_file_sha256(archive_path)
         if actual_archive_hash != expected_archive_hash:
             db.log_event("VERIFY", backup_id, "FAILED", "Archive SHA-256 mismatch")
+            self.logger.error("Verify failed for %s: SHA-256 mismatch", backup_id)
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -448,7 +587,12 @@ class BackupManager:
             )
 
         if not invoke_bash_verify_archive(archive_path, compression_enabled):
-            db.log_event("VERIFY", backup_id, "FAILED", "Archive tar/gzip structure corrupted")
+            db.log_event(
+                "VERIFY", backup_id, "FAILED", "Archive tar/gzip structure corrupted"
+            )
+            self.logger.error(
+                "Verify failed for %s: tar/gzip structure corrupted", backup_id
+            )
             return VerificationResult(
                 target_root=str(snapshot_dir),
                 is_valid=False,
@@ -461,7 +605,9 @@ class BackupManager:
         if backup_type == "incremental":
             diff_path = snapshot_dir / "incremental_diff.json"
             if not diff_path.is_file():
-                db.log_event("VERIFY", backup_id, "FAILED", "Missing incremental_diff.json")
+                db.log_event(
+                    "VERIFY", backup_id, "FAILED", "Missing incremental_diff.json"
+                )
                 return VerificationResult(
                     target_root=str(snapshot_dir),
                     is_valid=False,
@@ -502,6 +648,12 @@ class BackupManager:
                 backup_id,
                 "SUCCESS" if ver_res.is_valid else "FAILED",
                 f"Verified {len(ver_res.verified_files)} file(s)",
+            )
+            self.logger.info(
+                "Verified backup %s: valid=%s (%d files verified)",
+                backup_id,
+                ver_res.is_valid,
+                len(ver_res.verified_files),
             )
             return VerificationResult(
                 target_root=str(snapshot_dir),

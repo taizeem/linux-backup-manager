@@ -58,10 +58,7 @@ cmd_create() {
         exit "${EXIT_INVALID_ARGS}"
     fi
 
-    # Validate source directory existence and r+x permissions
     validate_source_directory "${source_arg}" || exit "$?"
-
-    # Ensure destination root exists and has w+x permissions
     ensure_destination_directory "${dest_root}" || exit "$?"
 
     local canonical_src
@@ -69,13 +66,11 @@ cmd_create() {
     local canonical_dest
     canonical_dest="$(resolve_canonical_path "${dest_root}")"
 
-    # Prevent backing up a directory into itself
     if [[ "${canonical_dest}" == "${canonical_src}" || "${canonical_dest}" == "${canonical_src}/"* ]]; then
         log_error "Destination directory (${canonical_dest}) cannot be inside source directory (${canonical_src})."
         exit "${EXIT_INVALID_ARGS}"
     fi
 
-    # Create and verify atomic staging directory (automatically removed on EXIT by trap)
     local staging_dir
     staging_dir="$(create_staging_dir "${canonical_dest}")" || exit "$?"
     LBM_ACTIVE_TEMP_DIRS+=("${staging_dir}")
@@ -90,9 +85,7 @@ cmd_create() {
         py_args+=(--incremental)
     fi
 
-    # Delegate file discovery and backup orchestration to the Python engine
     python3 "${LBM_PROJECT_ROOT}/python/main.py" "${py_args[@]}" || exit "$?"
-
     exit "${EXIT_SUCCESS}"
 }
 
@@ -125,6 +118,13 @@ cmd_backup_id_action() {
 
     local canonical_dest
     canonical_dest="$(resolve_canonical_path "${dest_root}")"
+
+    if [[ -d "${canonical_dest}/${backup_id}" || -f "${canonical_dest}/backup_catalog.db" ]]; then
+        python3 "${LBM_PROJECT_ROOT}/python/main.py" "${action}" \
+            --backup-id "${backup_id}" \
+            --dest "${canonical_dest}" || exit "$?"
+        exit "${EXIT_SUCCESS}"
+    fi
 
     print_banner
     printf "Action: %s\n" "${action}"
