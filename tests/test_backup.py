@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,12 +13,15 @@ if str(PROJECT_ROOT) not in sys.path:
 from python.backup import BackupManager
 from python.config import BackupConfig
 
+CRON_RUNNER_SH = PROJECT_ROOT / "scripts" / "cron_runner.sh"
+SCHEDULE_CRON_SH = PROJECT_ROOT / "scripts" / "schedule_cron.sh"
 
-class TestPhase4And5Backup(unittest.TestCase):
-    """Verify full and incremental backups, delta archiving, and version management."""
+
+class TestPhase4And5And9Backup(unittest.TestCase):
+    """Verify full/incremental backups, delta archiving, retention policies, and cron scripts."""
 
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory(prefix="lbm_test_p45_")
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="lbm_test_p459_")
         self.base = Path(self.temp_dir.name)
         self.source_dir = self.base / "source project"
         self.dest_dir = self.base / "backups"
@@ -102,26 +106,18 @@ class TestPhase4And5Backup(unittest.TestCase):
         cfg = BackupConfig(backup_root=self.dest_dir, compression_enabled=True)
         manager = BackupManager(config=cfg)
 
-        # 1. Create baseline full backup (3 files: app.py, app_link.py, nested folder/report 2026.txt)
         full_meta = manager.create_full_backup(self.source_dir, self.dest_dir)
 
-        # 2. Mutate workspace:
-        #    - Leave 'nested folder/report 2026.txt' UNCHANGED
-        #    - Modify 'app.py'
-        #    - Delete 'app_link.py'
-        #    - Add 'new_module.py'
         (self.source_dir / "app.py").write_text(
             "print('updated v2')\n", encoding="utf-8"
         )
         (self.source_dir / "app_link.py").unlink()
         (self.source_dir / "new_module.py").write_text("x = 42\n", encoding="utf-8")
 
-        # 3. Create incremental backup
         inc_meta = manager.create_incremental_backup(self.source_dir, self.dest_dir)
         self.assertEqual(inc_meta.backup_type, "incremental")
         self.assertEqual(inc_meta.parent_backup_id, full_meta.backup_id)
         self.assertEqual(inc_meta.files_discovered, 3)
-        # Only 2 files (app.py + new_module.py) should be backed up; 1 unchanged skipped!
         self.assertEqual(inc_meta.files_backed_up, 2)
         self.assertEqual(inc_meta.files_skipped, 1)
         self.assertEqual(inc_meta.files_deleted, 1)
@@ -133,14 +129,109 @@ class TestPhase4And5Backup(unittest.TestCase):
         self.assertEqual(diff_data["unchanged_paths"], ["nested folder/report 2026.txt"])
         self.assertEqual(diff_data["deleted_paths"], ["app_link.py"])
 
-        # 4. Verify incremental snapshot integrity
         ver = manager.verify_backup(inc_meta.backup_id, self.dest_dir)
         self.assertTrue(ver.is_valid, msg=f"Errors: {ver.errors}")
         self.assertEqual(ver.verified_files, ["app.py", "new_module.py"])
 
-        # 5. Verify version list returns both snapshots in order
         versions = manager.list_backups(self.dest_dir)
-        self.assertEqual([v.backup_id for v in versions], [full_meta.backup_id, inc_meta.backup_id])
+        self.assertEqual(
+            [v.backup_id for v in versions], [full_meta.backup_id, inc_meta.backup_id]
+        )
+
+    def test_retention_policy_prunes_old_chains_while_protecting_active_ancestors(self) -> None:
+        cfg = BackupConfig(backup_root=self.dest_dir, retention_count=2)
+        manager = BackupManager(config=cfg)
+
+        # Chain 1: b1 (full) -> b2 (inc)
+        b1 = manager.create_full_backup(
+            self.source_dir, self.dest_dir, backup_id="backup_2026_11_16_010000"
+        )
+        (self.source_dir / "app.py").write_text("v2\n", encoding="utf-8")
+        b2 = manager.create_incremental_backup(
+            self.source_dir, self.dest_dir, backup_id="backup_2026_11_16_020000"
+        )
+
+        # Chain 2: b3 (full) -> b4 (inc) -> b5 (inc)
+        b3 = manager.create_full_backup(
+            self.source_dir, self.dest_dir, backup_id="backup_2026_11_16_030000"
+        )
+        (self.source_dir / "app.py").write_text("v4\n", encoding="utf-8")
+        b4 = manager.create_incremental_backup(
+            self.source_dir, self.dest_dir, backup_id="backup_2026_11_16_040000"
+        )
+        (self.source_dir / "app.py").write_text("v5\n", encoding="utf-8")
+        b5 = manager.create_incremental_backup(
+            self.source_dir, self.dest_dir, backup_id="backup_2026_11_16_050000"
+        )
+
+        # Retain newest 2 (b4, b5). Because b4/b5 depend on b3 (full), b3 MUST be protected,
+        # while b1 and b2 (from superseded Chain 1) MUST be pruned!
+        pruned = manager.apply_retention_policy(self.dest_dir, keep_count=2)
+        self.assertEqual(pruned, [b1.backup_id, b2.backup_id])
+
+        remaining = [b.backup_id for b in manager.list_backups(self.dest_dir)]
+        self.assertEqual(remaining, [b3.backup_id, b4.backup_id, b5.backup_id])
+
+    def test_cron_runner_and_schedule_cron_scripts(self) -> None:
+        # 1. Test schedule_cron.sh --print (dry-run without modifying system crontab)
+        proc_print = subprocess.run(
+            [
+                "bash",
+                str(SCHEDULE_CRON_SH),
+                "--print",
+                "--source",
+                str(self.source_dir),
+                "--dest",
+                str(self.dest_dir),
+                "--schedule",
+                "30 3 * * *",
+                "--keep",
+                "5",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_print.returncode, 0, msg=proc_print.stderr)
+        self.assertIn("30 3 * * *", proc_print.stdout)
+        self.assertIn("cron_runner.sh", proc_print.stdout)
+        self.assertIn("# LINUX_BACKUP_MANAGER_AUTO_JOB", proc_print.stdout)
+
+        # 2. Test invalid cron schedule (only 3 fields) fails with exit code 1
+        proc_bad = subprocess.run(
+            [
+                "bash",
+                str(SCHEDULE_CRON_SH),
+                "--print",
+                "--source",
+                str(self.source_dir),
+                "--schedule",
+                "0 2 *",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_bad.returncode, 1)
+
+        # 3. Test cron_runner.sh executes end-to-end (recover + backup + prune) under flock
+        proc_run = subprocess.run(
+            [
+                "bash",
+                str(CRON_RUNNER_SH),
+                str(self.source_dir),
+                "--dest",
+                str(self.dest_dir),
+                "--incremental",
+                "--keep",
+                "3",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_run.returncode, 0, msg=proc_run.stderr)
+        self.assertIn("Backup status: SUCCESS", proc_run.stdout)
 
 
 if __name__ == "__main__":
