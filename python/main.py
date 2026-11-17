@@ -222,6 +222,35 @@ def handle_delete(args: argparse.Namespace, config: BackupConfig) -> int:
     return 0
 
 
+def handle_prune(args: argparse.Namespace, config: BackupConfig) -> int:
+    """Apply retention policy and prune old backup snapshots."""
+    manager = BackupManager(config=config)
+    dest_resolved = Path(args.dest).expanduser().resolve()
+    keep = args.keep if args.keep is not None else config.retention_count
+    try:
+        pruned = manager.apply_retention_policy(
+            dest_root=dest_resolved, keep_count=keep, protect_ancestors=True
+        )
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[INFO] Retention policy (keep={keep}) pruned {len(pruned)} backup(s).")
+    return 0
+
+
+def handle_recover(args: argparse.Namespace, config: BackupConfig) -> int:
+    """Detect and clean up incomplete backups and temporary staging artifacts."""
+    manager = BackupManager(config=config)
+    dest_resolved = Path(args.dest).expanduser().resolve()
+    rep = manager.recover_interrupted_backups(dest_root=dest_resolved)
+    print(
+        f"[INFO] Recovery cleaned {len(rep.incomplete_backups_removed)} incomplete backup(s) "
+        f"and {len(rep.staging_artifacts_removed)} temporary artifact(s)."
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lbm-engine",
@@ -312,6 +341,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--dest", required=True, help="Destination backup root path"
     )
 
+    # 'prune' subcommand
+    prune_parser = subparsers.add_parser("prune", help="Enforce backup retention policy")
+    prune_parser.add_argument(
+        "--dest", required=True, help="Destination backup root path"
+    )
+    prune_parser.add_argument(
+        "--keep", type=int, default=None, help="Number of newest backups to retain"
+    )
+
+    # 'recover' subcommand
+    recover_parser = subparsers.add_parser(
+        "recover", help="Clean incomplete backups and stale staging artifacts"
+    )
+    recover_parser.add_argument(
+        "--dest", required=True, help="Destination backup root path"
+    )
+
     return parser
 
 
@@ -332,6 +378,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return handle_restore(args, config)
     if args.command == "delete":
         return handle_delete(args, config)
+    if args.command == "prune":
+        return handle_prune(args, config)
+    if args.command == "recover":
+        return handle_recover(args, config)
 
     return 1
 

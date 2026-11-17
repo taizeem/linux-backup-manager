@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full and incremental backup orchestration, failure recovery, and verification."""
+"""Full and incremental backup orchestration, failure recovery, retention, and verification."""
 
 from __future__ import annotations
 
@@ -162,7 +162,7 @@ def invoke_bash_verify_archive(
 
 
 class BackupManager:
-    """Orchestrates full and incremental backups, recovery, SQLite persistence, and verification."""
+    """Orchestrates full and incremental backups, recovery, retention, and verification."""
 
     def __init__(
         self, config: BackupConfig | None = None, log_dir: Path | str | None = None
@@ -253,6 +253,51 @@ class BackupManager:
             staging_artifacts_removed=removed_staging,
         )
 
+    def apply_retention_policy(
+        self,
+        dest_root: Path | str | None = None,
+        keep_count: int | None = None,
+        protect_ancestors: bool = True,
+    ) -> list[str]:
+        """Prune old backups beyond keep_count while protecting ancestors needed by retained incrementals."""
+        dst_root = (
+            Path(dest_root).expanduser().resolve()
+            if dest_root is not None
+            else self.config.backup_root.expanduser().resolve()
+        )
+        limit = keep_count if keep_count is not None else self.config.retention_count
+        if limit < 1:
+            raise ValueError(f"keep_count must be >= 1, got {limit}")
+
+        all_backups = self.list_backups(dst_root)
+        if len(all_backups) <= limit:
+            return []
+
+        by_id: dict[str, BackupMetadata] = {b.backup_id: b for b in all_backups}
+        retained_Primary = all_backups[-limit:]
+        protected_ids: set[str] = {b.backup_id for b in retained_Primary}
+
+        if protect_ancestors:
+            for snap in retained_Primary:
+                curr_parent = snap.parent_backup_id
+                while curr_parent and curr_parent in by_id:
+                    protected_ids.add(curr_parent)
+                    curr_parent = by_id[curr_parent].parent_backup_id
+
+        deleted_ids: list[str] = []
+        for snap in all_backups[:-limit]:
+            if snap.backup_id not in protected_ids:
+                if self.delete_backup(snap.backup_id, dst_root):
+                    deleted_ids.append(snap.backup_id)
+
+        if deleted_ids:
+            self.logger.info(
+                "Retention policy pruned %d old backup(s): %s",
+                len(deleted_ids),
+                ", ".join(deleted_ids),
+            )
+        return deleted_ids
+
     def create_backup(
         self,
         source_dir: Path | str,
@@ -313,7 +358,6 @@ class BackupManager:
             files_skipped_count = scan_result.files_skipped_excluded
             files_deleted_count = 0
 
-        # Pre-flight disk space check via os.statvfs before writing archive
         bytes_to_archive = sum(
             m.size_bytes for m in entries_to_archive if not m.is_symlink
         )
@@ -408,9 +452,7 @@ class BackupManager:
             )
             return metadata
         except Exception as exc:
-            self.logger.error(
-                "Backup failed for %s: %s", src_path, exc
-            )
+            self.logger.error("Backup failed for %s: %s", src_path, exc)
             raise
         finally:
             if staged_snapshot_dir.exists():

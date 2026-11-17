@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # File: bash/cleanup.sh
-# Description: Removes stale temporary staging directories (.lbm_staging.*) and
-#              incomplete .tmp archives from the backup destination directory.
+# Description: Removes stale temporary staging directories (.lbm_staging.*),
+#              incomplete .tmp archives, and optionally prunes old backups.
 # ==============================================================================
 
 set -euo pipefail
@@ -18,6 +18,7 @@ Usage: $(basename "$0") [options]
 Options:
   -d, --dest <dest_dir>    Target backup root directory to clean
                            (Default: \$LBM_BACKUP_ROOT or ~/backups)
+  -k, --keep <count>       Also prune old backups, retaining newest <count>
   -h, --help               Show this help message and exit
 EOF
 }
@@ -35,7 +36,6 @@ purge_stale_temp_artifacts() {
     local removed_count=0
     local entry
 
-    # Use nullglob so non-matching globs expand to nothing instead of literal strings
     shopt -s nullglob
     for entry in "${target_dir}"/.lbm_staging.* "${target_dir}"/*.tmp; do
         if [[ -e "${entry}" || -L "${entry}" ]]; then
@@ -51,6 +51,7 @@ purge_stale_temp_artifacts() {
 
 main() {
     local dest_dir="${DEFAULT_BACKUP_ROOT}"
+    local keep_count=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -66,6 +67,14 @@ main() {
                 dest_dir="$2"
                 shift 2
                 ;;
+            -k|--keep)
+                if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                    log_error "Option '$1' requires a positive integer keep count."
+                    exit "${EXIT_INVALID_ARGS}"
+                fi
+                keep_count="$2"
+                shift 2
+                ;;
             *)
                 log_error "Unknown argument: $1"
                 usage >&2
@@ -76,6 +85,14 @@ main() {
 
     ensure_destination_directory "${dest_dir}" || exit "$?"
     purge_stale_temp_artifacts "${dest_dir}" || exit "$?"
+
+    if [[ -n "${keep_count}" ]]; then
+        local canonical_dest
+        canonical_dest="$(resolve_canonical_path "${dest_dir}")"
+        python3 "${LBM_PROJECT_ROOT}/python/main.py" prune \
+            --dest "${canonical_dest}" \
+            --keep "${keep_count}" || exit "$?"
+    fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
